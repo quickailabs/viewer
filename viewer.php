@@ -1,106 +1,129 @@
 <?php
 
-require_once 'config.php';
+// Define path for the metadata JSON file
+define('METADATA_FILE', 'metadata.json');
 
-// --- Step 2: Get File ID ---
-if (!isset($_GET['id']) || !is_numeric($_GET['id'])) {
+// --- Step 3: Validate Input ID ---
+if (!isset($_GET['id'])) {
     http_response_code(400); // Bad Request
-    die("Error: Invalid or missing file ID.");
+    die("Error: Missing file ID.");
 }
-$file_id = (int)$_GET['id']; // Cast to integer
+$file_id = $_GET['id']; // Get the ID (can be string like uniqid generates)
 
-// --- Step 3: Database Connection & Query ---
-$db_connection = null;
-$file_data = null;
-$db_error_message = '';
+// --- Step 4: Read and Decode JSON ---
+$metadata = [];
+$metadata_error_message = '';
 
-// Build connection string
-$conn_string = sprintf("host=%s port=%s dbname=%s user=%s password=%s",
-    DB_HOST,
-    DB_PORT,
-    DB_NAME,
-    DB_USER,
-    DB_PASS
-);
+if (file_exists(METADATA_FILE) && is_readable(METADATA_FILE)) {
+    $json_content = file_get_contents(METADATA_FILE);
+    if ($json_content === false) {
+        $metadata_error_message = "Error: Could not read metadata file.";
+        error_log("Failed to read metadata file: " . METADATA_FILE);
+    } else {
+        if (trim($json_content) === '') {
+             $metadata = []; // Treat empty file as empty list
+        } else {
+            $decoded_data = json_decode($json_content, true); // Decode as associative array
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                $metadata_error_message = "Error: Metadata file is corrupted or not valid JSON.";
+                error_log("JSON decode error (" . json_last_error() . ") in " . METADATA_FILE . ": " . json_last_error_msg());
+            } elseif (!is_array($decoded_data)) {
+                $metadata_error_message = "Error: Metadata file format is invalid (expected JSON array).";
+                error_log("Invalid metadata format in " . METADATA_FILE . ": Expected array, got " . gettype($decoded_data));
+            } else {
+                $metadata = $decoded_data;
+            }
+        }
+    }
+} elseif (!file_exists(METADATA_FILE)) {
+    $metadata_error_message = "Error: Metadata file not found.";
+    error_log("Metadata file does not exist: " . METADATA_FILE);
+} else {
+    $metadata_error_message = "Error: Metadata file exists but is not readable.";
+    error_log("Metadata file not readable: " . METADATA_FILE);
+}
 
-// Establish connection
-$db_connection = pg_connect($conn_string);
-
-if (!$db_connection) {
+// If there was an error reading or parsing metadata, stop here
+if ($metadata_error_message) {
     http_response_code(500); // Internal Server Error
-    die("Error: Could not connect to the database.");
+    die(htmlspecialchars($metadata_error_message));
 }
 
-// Prepare and execute parameterized query
-$query = "SELECT original_filename, stored_filename, mime_type FROM files WHERE id = $1";
-$result = pg_query_params($db_connection, $query, array($file_id));
-
-if (!$result) {
-    pg_close($db_connection);
-    http_response_code(500); // Internal Server Error
-    die("Error: Could not query the database.");
+// --- Step 5: Find File Metadata by ID ---
+$file_data = null; // Initialize before loop
+foreach ($metadata as $item) {
+    // Ensure the item has an 'id' key before comparing
+    if (isset($item['id']) && $item['id'] === $file_id) {
+        $file_data = $item;
+        break; // Found the file, exit loop
+    }
 }
 
-// --- Step 4: Check File Existence (Database) ---
-if (pg_num_rows($result) === 0) {
-    pg_close($db_connection);
+// --- Step 6: Check File Found ---
+if ($file_data === null) {
     http_response_code(404); // Not Found
-    die("Error: File not found in database.");
+    die("Error: File not found."); // User-friendly message
 }
 
-$file_data = pg_fetch_assoc($result);
-pg_close($db_connection); // Close connection after fetching
+// --- Step 7 & 8: Use Retrieved Metadata & Keep Existing Logic ---
 
-// --- Step 5: Construct File Path & Check Existence (Filesystem) ---
+// Validate necessary keys exist in $file_data before proceeding
+if (!isset($file_data['stored_filename']) || !isset($file_data['original_filename']) || !isset($file_data['mime_type'])) {
+     http_response_code(500); // Internal Server Error
+     error_log("Incomplete metadata for ID " . $file_id . " in " . METADATA_FILE);
+     die("Error: Incomplete file metadata found.");
+}
+
+// Construct File Path & Check Existence (Filesystem)
 $upload_dir = 'uploads/';
-// --- Security Enhancement: Apply basename() to stored filename ---
+// Apply basename() to stored filename for security
 $safe_stored_filename = basename($file_data['stored_filename']);
 $file_path = $upload_dir . $safe_stored_filename;
-// -----------------------------------------------------------------
 
 if (!file_exists($file_path) || !is_readable($file_path)) {
     http_response_code(404); // Not Found
-    error_log("File not found or not readable on server: " . $file_path); // Log for debugging
+    error_log("File not found or not readable on server: " . $file_path . " (Metadata ID: " . $file_id . ")");
     die("Error: File not found on server or cannot be accessed.");
 }
 
-// --- Step 7: Refinement (Download Logic) ---
+// Download Logic
 if (isset($_GET['download'])) {
+    // Ensure file_size is available for Content-Length, provide default if not
+    $file_size = isset($file_data['file_size']) ? $file_data['file_size'] : filesize($file_path);
+
     header('Content-Description: File Transfer');
     header('Content-Type: application/octet-stream');
+    // Use basename() on original_filename just in case
     header('Content-Disposition: attachment; filename="' . basename($file_data['original_filename']) . '"');
     header('Expires: 0');
     header('Cache-Control: must-revalidate');
     header('Pragma: public');
-    header('Content-Length: ' . filesize($file_path));
+    header('Content-Length: ' . $file_size);
     flush(); // Flush system output buffer
     readfile($file_path);
     exit;
 }
 
-// --- Step 6: Determine Action Based on MIME Type ---
+// Determine Action Based on MIME Type
 $mime_type = $file_data['mime_type'];
 
 // Check if it's an image type
 if (strpos($mime_type, 'image/') === 0) {
-    // Output image directly
     header('Content-Type: ' . $mime_type);
-    header('Content-Disposition: inline; filename="' . basename($file_data['original_filename']) . '"'); // Suggest inline display
+    header('Content-Disposition: inline; filename="' . basename($file_data['original_filename']) . '"');
     readfile($file_path);
     exit;
 }
 
 // Check if it's a PDF
 if ($mime_type === 'application/pdf') {
-    // Output PDF directly
     header('Content-Type: application/pdf');
-    header('Content-Disposition: inline; filename="' . basename($file_data['original_filename']) . '"'); // Suggest inline display
+    header('Content-Disposition: inline; filename="' . basename($file_data['original_filename']) . '"');
     readfile($file_path);
     exit;
 }
 
-// --- Step 8: HTML Structure for Non-Direct Output (Default Case) ---
-// If not an image, not PDF, and not a download request, show a page with a download link.
+// HTML Structure for Non-Direct Output (Default Case)
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -122,7 +145,7 @@ if ($mime_type === 'application/pdf') {
         <p><strong>MIME Type:</strong> <?php echo htmlspecialchars($mime_type); ?></p>
         <p>Preview is not available for this file type.</p>
     </div>
-    <a href="viewer.php?id=<?php echo $file_id; ?>&download=1" class="download-link">Download File</a>
+    <a href="viewer.php?id=<?php echo urlencode($file_id); ?>&download=1" class="download-link">Download File</a>
     <br><br>
     <p><a href="index.php">Back to Uploads</a></p>
 </body>

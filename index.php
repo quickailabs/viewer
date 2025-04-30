@@ -1,40 +1,48 @@
 <?php
-require_once 'config.php';
+// Define path for the metadata JSON file
+define('METADATA_FILE', 'metadata.json');
 
-$db_connection = null;
-$files = [];
-$db_error_message = '';
+$files_metadata = [];
+$metadata_error_message = '';
 
-// Build connection string
-$conn_string = sprintf("host=%s port=%s dbname=%s user=%s password=%s",
-    DB_HOST,
-    DB_PORT,
-    DB_NAME,
-    DB_USER,
-    DB_PASS
-);
+// --- Step 3: Read and Decode JSON ---
+if (file_exists(METADATA_FILE) && is_readable(METADATA_FILE)) {
+    $json_content = file_get_contents(METADATA_FILE);
 
-// Establish connection
-$db_connection = pg_connect($conn_string);
-
-if (!$db_connection) {
-    $db_error_message = "Error: Could not connect to the database.";
-} else {
-    // Query Files
-    $query = "SELECT id, original_filename, upload_timestamp FROM files ORDER BY upload_timestamp DESC";
-    $result = pg_query($db_connection, $query);
-
-    if (!$result) {
-        $db_error_message = "Error: Could not retrieve file list from the database.";
+    if ($json_content === false) {
+        $metadata_error_message = "Error: Could not read metadata file.";
+        error_log("Failed to read metadata file: " . METADATA_FILE);
     } else {
-        // Fetch all results into an array
-        while ($row = pg_fetch_assoc($result)) {
-            $files[] = $row;
+        // Check if content is empty before decoding
+        if (trim($json_content) === '') {
+             $files_metadata = []; // Treat empty file as empty list
+        } else {
+            $decoded_data = json_decode($json_content, true); // Decode as associative array
+
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                $metadata_error_message = "Error: Metadata file is corrupted or not valid JSON.";
+                error_log("JSON decode error (" . json_last_error() . ") in " . METADATA_FILE . ": " . json_last_error_msg());
+            } elseif (!is_array($decoded_data)) {
+                $metadata_error_message = "Error: Metadata file format is invalid (expected JSON array).";
+                error_log("Invalid metadata format in " . METADATA_FILE . ": Expected array, got " . gettype($decoded_data));
+            } else {
+                $files_metadata = $decoded_data;
+                // Optional: Sort files by timestamp descending (if needed)
+                usort($files_metadata, function($a, $b) {
+                    return ($b['upload_timestamp'] ?? 0) <=> ($a['upload_timestamp'] ?? 0); // Sort descending, handle missing keys
+                });
+            }
         }
     }
-    // Close connection only after fetching data
-    pg_close($db_connection);
+} elseif (!file_exists(METADATA_FILE)) {
+    // File doesn't exist, which is fine on first run, treat as empty list
+    $files_metadata = [];
+} else {
+    // File exists but is not readable
+    $metadata_error_message = "Error: Metadata file exists but is not readable.";
+    error_log("Metadata file not readable: " . METADATA_FILE);
 }
+
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -104,10 +112,14 @@ if (!$db_connection) {
 
     <h2>Uploaded Files</h2>
 
-    <?php if ($db_error_message): ?>
-        <p class="error"><?php echo htmlspecialchars($db_error_message); ?></p>
-    <?php elseif (empty($files)): ?>
-        <p>No files uploaded yet.</p>
+    <?php if ($metadata_error_message): ?>
+        <p class="error"><?php echo htmlspecialchars($metadata_error_message); ?></p>
+    <?php endif; ?>
+
+    <?php if (empty($files_metadata)): ?>
+        <?php if (!$metadata_error_message): // Only show "No files" if there wasn't an error reading metadata ?>
+            <p>No files uploaded yet.</p>
+        <?php endif; ?>
     <?php else: ?>
         <table>
             <thead>
@@ -118,12 +130,16 @@ if (!$db_connection) {
                 </tr>
             </thead>
             <tbody>
-                <?php foreach ($files as $file): ?>
+                <?php foreach ($files_metadata as $file): ?>
                     <tr>
-                        <td><?php echo htmlspecialchars($file['original_filename']); ?></td>
-                        <td><?php echo htmlspecialchars($file['upload_timestamp']); ?></td>
+                        <td><?php echo htmlspecialchars($file['original_filename'] ?? 'N/A'); // Use null coalesce for safety ?></td>
+                        <td><?php echo isset($file['upload_timestamp']) ? date('Y-m-d H:i:s', $file['upload_timestamp']) : 'N/A'; // Format timestamp ?></td>
                         <td>
-                            <a href="viewer.php?id=<?php echo urlencode($file['id']); ?>">View</a>
+                            <?php if (isset($file['id'])): ?>
+                                <a href="viewer.php?id=<?php echo urlencode($file['id']); ?>">View</a>
+                            <?php else: ?>
+                                N/A
+                            <?php endif; ?>
                         </td>
                     </tr>
                 <?php endforeach; ?>

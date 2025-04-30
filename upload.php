@@ -1,6 +1,7 @@
 <?php
 
-require_once 'config.php';
+// Define path for the metadata JSON file
+define('METADATA_FILE', 'metadata.json');
 
 // --- Security Enhancements: Configuration ---
 // Define allowed MIME types (adjust as needed)
@@ -21,7 +22,7 @@ $max_file_size = 10 * 1024 * 1024; // 10 MB in bytes
 
 $message = '';
 $error = false;
-$db_connection = null; // Initialize DB connection variable
+$fp = null; // Initialize file pointer
 
 // Check if form was submitted and file exists
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_FILES['uploaded_file'])) {
@@ -30,6 +31,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_FILES['uploaded_file'])) {
     // Check for basic upload errors first
     if ($file['error'] !== UPLOAD_ERR_OK) {
         $error = true;
+        // (Error messages for upload errors remain the same)
         switch ($file['error']) {
             case UPLOAD_ERR_INI_SIZE:
             case UPLOAD_ERR_FORM_SIZE:
@@ -72,65 +74,108 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_FILES['uploaded_file'])) {
         }
         // -----------------------------------------
         else {
-            // Validation passed, proceed with moving and DB insertion
+            // Validation passed, proceed with moving and metadata update
             $upload_dir = 'uploads/';
             // Generate a unique filename to prevent overwrites and hide original name on server
-            $stored_filename = uniqid('', true) . '-' . $original_filename; // Add more entropy with second param
+            $stored_filename = uniqid('', true) . '-' . $original_filename; // Add more entropy
             $target_path = $upload_dir . $stored_filename;
 
             // Attempt to move the uploaded file
             if (move_uploaded_file($file['tmp_name'], $target_path)) {
-                // File moved successfully, now connect to DB
+                // File moved successfully, now update metadata.json
 
-                // Build connection string
-                $conn_string = sprintf("host=%s port=%s dbname=%s user=%s password=%s",
-                    DB_HOST,
-                    DB_PORT,
-                    DB_NAME,
-                    DB_USER,
-                    DB_PASS
-                );
-
-                // Establish connection
-                $db_connection = pg_connect($conn_string);
-
-                if (!$db_connection) {
-                    $error = true;
-                    $message = "Error: Could not connect to the database.";
-                    // Clean up: Remove the uploaded file if DB connection fails
-                    if (file_exists($target_path)) unlink($target_path);
-                } else {
-                    // --- Security Enhancement: Parameterized Query & Sanitization ---
-                    // Sanitize original filename before DB insertion
-                    $sanitized_original_filename = htmlspecialchars($original_filename, ENT_QUOTES, 'UTF-8');
-
-                    // Construct parameterized SQL query
-                    $query = "INSERT INTO files (original_filename, stored_filename, mime_type, file_size) VALUES ($1, $2, $3, $4)";
-                    $params = [
-                        $sanitized_original_filename, // Use sanitized version
-                        $stored_filename,
-                        $mime_type,
-                        $file_size // Integer, safe to pass directly
-                    ];
-
-                    // Execute parameterized query
-                    $result = pg_query_params($db_connection, $query, $params);
-                    // -------------------------------------------------------------
-
-                    if (!$result) {
-                        $error = true;
-                        // Log the detailed error instead of showing it to the user
-                        error_log("Database Error: " . pg_last_error($db_connection));
-                        $message = "Error: Could not save file metadata to the database.";
-                        // Clean up: Remove the uploaded file if DB insertion fails
-                        if (file_exists($target_path)) unlink($target_path);
-                    } else {
-                        $message = "File uploaded successfully!";
+                // --- JSON Metadata Update Logic ---
+                try {
+                    // Open file for read/write, create if doesn't exist
+                    $fp = fopen(METADATA_FILE, 'c+');
+                    if (!$fp) {
+                        throw new Exception("Could not open metadata file.");
                     }
 
-                    // Close the database connection
-                    pg_close($db_connection);
+                    // Acquire exclusive lock
+                    if (!flock($fp, LOCK_EX)) {
+                        throw new Exception("Could not lock metadata file.");
+                    }
+
+                    // Read existing data
+                    $file_content = '';
+                    $file_stat = fstat($fp);
+                    if ($file_stat['size'] > 0) {
+                         $file_content = fread($fp, $file_stat['size']);
+                         if ($file_content === false) {
+                             throw new Exception("Could not read metadata file.");
+                         }
+                    }
+                    // Initialize metadata if file is empty or read failed
+                    if (empty($file_content)) {
+                        $metadata = [];
+                    } else {
+                        // Decode JSON
+                        $metadata = json_decode($file_content, true); // Decode as associative array
+                        if (json_last_error() !== JSON_ERROR_NONE || !is_array($metadata)) {
+                            // Handle potential corruption or invalid format
+                             error_log("JSON decode error or invalid format in " . METADATA_FILE . ": " . json_last_error_msg());
+                             throw new Exception("Metadata file format is invalid. Cannot proceed.");
+                             // Alternatively, could attempt to overwrite with [] or backup/rename the corrupted file
+                             // For now, we error out to prevent data loss.
+                        }
+                    }
+
+                    // Generate unique ID
+                    $new_id = uniqid();
+
+                    // Prepare new entry (sanitize original filename just in case)
+                    $new_entry = [
+                        'id' => $new_id,
+                        'original_filename' => htmlspecialchars($original_filename, ENT_QUOTES, 'UTF-8'),
+                        'stored_filename' => $stored_filename,
+                        'mime_type' => $mime_type,
+                        'file_size' => $file_size,
+                        'upload_timestamp' => time() // Use Unix timestamp
+                    ];
+
+                    // Append new entry
+                    $metadata[] = $new_entry;
+
+                    // Encode updated data
+                    $json_data = json_encode($metadata, JSON_PRETTY_PRINT);
+                    if ($json_data === false) {
+                        throw new Exception("Could not encode metadata to JSON.");
+                    }
+
+                    // Write updated data back to file
+                    if (ftruncate($fp, 0) === false) { // Truncate the file
+                         throw new Exception("Could not truncate metadata file.");
+                    }
+                    if (fseek($fp, 0) === -1) { // Rewind pointer
+                         throw new Exception("Could not seek in metadata file.");
+                    }
+                    if (fwrite($fp, $json_data) === false) {
+                        throw new Exception("Could not write to metadata file.");
+                    }
+                    fflush($fp); // Ensure data is written before releasing lock
+
+                    $message = "File uploaded successfully!";
+
+                } catch (Exception $e) {
+                    $error = true;
+                    $message = "Error: Could not update metadata. " . $e->getMessage();
+                    // Log the detailed error
+                    error_log("Metadata Update Error: " . $e->getMessage());
+                    // Clean up: Remove the uploaded file if metadata update fails
+                    if (file_exists($target_path)) {
+                        unlink($target_path);
+                        error_log("Cleaned up file due to metadata error: " . $target_path);
+                    }
+                } finally {
+                    // Always release lock and close file if open
+                    if ($fp) {
+                        flock($fp, LOCK_UN); // Release the lock
+                        fclose($fp); // Close the file handle
+                    }
                 }
+                // --- End JSON Metadata Update Logic ---
+
             } else {
                 $error = true;
                 $message = "Error: Failed to move uploaded file. Check permissions or path.";
@@ -145,10 +190,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_FILES['uploaded_file'])) {
     $message = "Invalid request or no file selected.";
 }
 
-// Ensure connection is closed if it was opened and an error occurred before pg_close was reached
-if ($db_connection) {
-    @pg_close($db_connection); // Use @ to suppress errors if connection already closed
-}
+// No database connection to close anymore
 
 ?>
 <!DOCTYPE html>
